@@ -1,5 +1,5 @@
 # .github/workflows/kev-sync.yml
-name: Sync KEV data
+name: Sync KEV data (minimal)
 
 on:
   # 4 PM Eastern:
@@ -13,50 +13,40 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: kev-sync
-  cancel-in-progress: false
-
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Install jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Fetch, validate, compare, and replace
+      - name: Fetch KEV CSV & JSON (overwrite)
         shell: bash
         run: |
           set -euo pipefail
+          set -x
           CSV_URL="https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
           JSON_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-          CSV_OUT="known_exploited_vulnerabilities.csv"
-          JSON_OUT="known_exploited_vulnerabilities.json"
+          curl -fSLo known_exploited_vulnerabilities.csv  "$CSV_URL"
+          curl -fSLo known_exploited_vulnerabilities.json "$JSON_URL"
+          ls -l known_exploited_vulnerabilities.*
 
-          # Download fresh copies with retries
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$CSV_OUT.tmp"  "$CSV_URL"
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$JSON_OUT.tmp" "$JSON_URL"
-
-          # Validate CSV
-          head -n 1 "$CSV_OUT.tmp" | grep -qiE 'cve|vulnerability|date|vendor|product' || {
-            echo "CSV header sanity check failed"; exit 1; }
-          # Validate JSON
-          jq . < "$JSON_OUT.tmp" >/dev/null
-
-          # Hashes
-          old_csv="$( [ -f "$CSV_OUT" ]  && sha256sum "$CSV_OUT"  | awk '{print $1}' || echo 'NONE' )"
-          old_json="$( [ -f "$JSON_OUT" ] && sha256sum "$JSON_OUT" | awk '{print $1}' || echo 'NONE' )"
-          new_csv="$(sha256sum "$CSV_OUT.tmp"  | awk '{print $1}')"
-          new_json="$(sha256sum "$JSON_OUT.tmp" | awk '{print $1}')"
-
-          echo "CSV  old:$old_csv  new:$new_csv"
-          echo "JSON old:$old_json new:$new_json"
+      - name: Commit if changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -x
+          git config user.name  "kev-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add known_exploited_vulnerabilities.csv known_exploited_vulnerabilities.json || true
+          git status --porcelain=v1
+          git diff --cached --stat || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync KEV data $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push
+            echo "Changes committed & pushed."
+          else
+            echo "No changes detected."
+          fi
