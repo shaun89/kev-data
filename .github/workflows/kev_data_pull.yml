@@ -21,84 +21,42 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
-      - name: Checkout (shallow)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Ensure jq
+      - name: Install jq
         run: |
-          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Fetch → validate → hash-compare → replace if changed
+      - name: Fetch, validate, compare, and replace
         shell: bash
         run: |
           set -euo pipefail
-          set -x
-
           CSV_URL="https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
           JSON_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
           CSV_OUT="known_exploited_vulnerabilities.csv"
           JSON_OUT="known_exploited_vulnerabilities.json"
 
-          # Always download to temp (with retries)
+          # Download fresh copies with retries
           curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$CSV_OUT.tmp"  "$CSV_URL"
           curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$JSON_OUT.tmp" "$JSON_URL"
 
-          # Validate before touching originals
+          # Validate CSV
           head -n 1 "$CSV_OUT.tmp" | grep -qiE 'cve|vulnerability|date|vendor|product' || {
             echo "CSV header sanity check failed"; exit 1; }
+          # Validate JSON
           jq . < "$JSON_OUT.tmp" >/dev/null
 
-          # Compute old/new hashes (OLD may not exist on first run)
-          old_csv_hash="$( [ -f "$CSV_OUT" ]  && sha256sum "$CSV_OUT"  | awk '{print $1}' || echo 'NONE' )"
-          old_json_hash="$( [ -f "$JSON_OUT" ] && sha256sum "$JSON_OUT" | awk '{print $1}' || echo 'NONE' )"
-          new_csv_hash="$(sha256sum "$CSV_OUT.tmp"  | awk '{print $1}')"
-          new_json_hash="$(sha256sum "$JSON_OUT.tmp" | awk '{print $1}')"
+          # Hashes
+          old_csv="$( [ -f "$CSV_OUT" ]  && sha256sum "$CSV_OUT"  | awk '{print $1}' || echo 'NONE' )"
+          old_json="$( [ -f "$JSON_OUT" ] && sha256sum "$JSON_OUT" | awk '{print $1}' || echo 'NONE' )"
+          new_csv="$(sha256sum "$CSV_OUT.tmp"  | awk '{print $1}')"
+          new_json="$(sha256sum "$JSON_OUT.tmp" | awk '{print $1}')"
 
-          echo "CSV  old:$old_csv_hash  new:$new_csv_hash"
-          echo "JSON old:$old_json_hash new:$new_json_hash"
-
-          # Replace only when content actually changed
-          if [ "$old_csv_hash" != "$new_csv_hash" ]; then
-            mv -f "$CSV_OUT.tmp" "$CSV_OUT"
-          else
-            rm -f "$CSV_OUT.tmp"
-          fi
-
-          if [ "$old_json_hash" != "$new_json_hash" ]; then
-            mv -f "$JSON_OUT.tmp" "$JSON_OUT"
-          else
-            rm -f "$JSON_OUT.tmp"
-          fi
-
-          ls -l "$CSV_OUT" "$JSON_OUT" || true
-
-      - name: Debug: show git status/diff
-        shell: bash
-        run: |
-          set -euo pipefail
-          git status --porcelain=v1
-          echo "==== DIFF (working vs HEAD) ===="
-          git diff --stat || true
-
-      - name: Commit if data changed
-        run: |
-          set -euo pipefail
-          git config user.name  "kev-sync-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add known_exploited_vulnerabilities.csv known_exploited_vulnerabilities.json || true
-
-          echo "==== DIFF (cached vs HEAD) ===="
-          git diff --cached --stat || true
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: sync KEV data $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
-            echo "Changes committed & pushed."
-          else
-            echo "No changes detected."
-          fi
+          echo "CSV  old:$old_csv  new:$new_csv"
+          echo "JSON old:$old_json new:$new_json"
