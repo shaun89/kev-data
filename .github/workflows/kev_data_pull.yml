@@ -2,106 +2,96 @@
 name: Sync KEV data
 
 on:
-  # GitHub cron is always in UTC. To hit 4:00 PM Eastern year-round:
-  # - During Daylight Saving Time (roughly Mar–Oct): 4 PM ET == 20:00 UTC
-  # - During Standard Time (roughly Nov–Feb):        4 PM ET == 21:00 UTC
-  # These two schedules cover both cases. There will be a small drift
-  # around the exact DST switch days (a few days each March/November).
+  # 4 PM Eastern year-round:
+  #  - Mar–Oct (DST): 20:00 UTC
+  #  - Nov–Feb:       21:00 UTC
   schedule:
-    - cron: "0 20 * 3-10 *"       # 20:00 UTC daily, March–October  (≈ 4 PM EDT)
-    - cron: "0 21 * 11,12,1,2 *"  # 21:00 UTC daily, Nov–Feb        (≈ 4 PM EST)
-  workflow_dispatch: {}            # allow manual runs from the Actions tab
+    - cron: "0 20 * 3-10 *"
+    - cron: "0 21 * 11,12,1,2 *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write                  # needed to commit/push updated files
+  contents: write   # allow commits/pushes via GITHUB_TOKEN
 
 concurrency:
-  group: kev-sync                  # avoids overlapping runs if one lingers
+  group: kev-sync
   cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 5             # keep the job from hanging forever
+    timeout-minutes: 5
+
     steps:
-      # 1) Check out your repo (shallow for speed)
-      - name: Checkout
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 2) Make sure 'jq' is available for JSON validation
-      - name: Ensure jq is installed
+      - name: Ensure jq
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      # 3) Fetch KEV CSV/JSON safely, validate, then replace originals atomically
-      #
-      # How it works:
-      # - We download to *.tmp first so we never clobber good files with bad/empty ones.
-      # - We use curl retries for resilience and '-z <file>' (conditional GET) to skip
-      #   downloading if the remote hasn't changed since our local copy.
-      # - If server returns HTTP 304 (Not Modified), curl may create an empty .tmp; we
-      #   simply delete it and keep the existing file.
-      # - We sanity-check the CSV header and parse the JSON with jq before replacing.
-      - name: Fetch & validate → replace atomically
+      - name: Fetch & validate → replace atomically (with logs)
+        shell: bash
         run: |
           set -euo pipefail
+          set -x
 
-          # Official CISA endpoints
           CSV_URL="https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
           JSON_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-
-          # Final filenames in your repo
+          UA="kev-sync/1.0 (+github actions)"
           CSV_OUT="known_exploited_vulnerabilities.csv"
           JSON_OUT="known_exploited_vulnerabilities.json"
 
-          # --- Download to temporary files with retries + conditional GET ---
-          # --retry/--retry-delay/--retry-all-errors: handle transient network/server hiccups
-          # -z <dest>: send If-Modified-Since header based on local file mtime to avoid
-          #            needless downloads if nothing changed on the server.
+          # Show current repo state for debugging
+          ls -l || true
+
+          # HEAD requests for visibility
+          curl -I -H "User-Agent: $UA" "$CSV_URL"  || true
+          curl -I -H "User-Agent: $UA" "$JSON_URL" || true
+
+          # Download to temp with retries + conditional GET
           curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-            -z "${CSV_OUT}" \
-            -o "${CSV_OUT}.tmp" "${CSV_URL}"
+               -H "User-Agent: $UA" \
+               -z "$CSV_OUT" -o "$CSV_OUT.tmp" "$CSV_URL" || exit 1
 
           curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-            -z "${JSON_OUT}" \
-            -o "${JSON_OUT}.tmp" "${JSON_URL}"
+               -H "User-Agent: $UA" \
+               -z "$JSON_OUT" -o "$JSON_OUT.tmp" "$JSON_URL" || exit 1
 
-          # If the server replied "Not Modified", the .tmp can be empty. Remove it.
-          [ -s "${CSV_OUT}.tmp" ]  || rm -f "${CSV_OUT}.tmp"
-          [ -s "${JSON_OUT}.tmp" ] || rm -f "${JSON_OUT}.tmp"
+          # If 304 (Not Modified), temp can be empty—clean it up
+          [ -s "$CSV_OUT.tmp" ]  || rm -f "$CSV_OUT.tmp"
+          [ -s "$JSON_OUT.tmp" ] || rm -f "$JSON_OUT.tmp"
 
-          # --- Validate and atomically replace the originals (only when new files exist) ---
-          # CSV sanity: check header has expected concepts; tweak the regex if you want stricter checks.
-          if [ -f "${CSV_OUT}.tmp" ]; then
-            head -n 1 "${CSV_OUT}.tmp" | grep -qiE 'cve|vulnerability|date|vendor|product' || {
-              echo "CSV header sanity check failed"; exit 1; }
-            mv -f "${CSV_OUT}.tmp" "${CSV_OUT}"
+          # Validate + swap in place
+          if [ -f "$CSV_OUT.tmp" ]; then
+            head -n 1 "$CSV_OUT.tmp" | grep -qiE 'cve|vulnerability|date|vendor|product' \
+              || { echo "CSV header sanity check failed"; exit 1; }
+            mv -f "$CSV_OUT.tmp" "$CSV_OUT"
           fi
 
-          # JSON sanity: ensure it parses cleanly
-          if [ -f "${JSON_OUT}.tmp" ]; then
-            jq . < "${JSON_OUT}.tmp" >/dev/null
-            mv -f "${JSON_OUT}.tmp" "${JSON_OUT}"
+          if [ -f "$JSON_OUT.tmp" ]; then
+            jq . < "$JSON_OUT.tmp" >/dev/null
+            mv -f "$JSON_OUT.tmp" "$JSON_OUT"
           fi
 
-      # 4) Commit only if there are actual changes (avoids noisy empty commits)
+          # Show final sizes for visibility
+          ls -l "$CSV_OUT" "$JSON_OUT" || true
+
       - name: Commit if data changed
         run: |
           set -euo pipefail
           git config user.name  "kev-sync-bot"
           git config user.email "actions@users.noreply.github.com"
-
-          # Stage the files (ok if they didn't change—next step checks)
           git add known_exploited_vulnerabilities.csv known_exploited_vulnerabilities.json || true
 
-          # If the index differs from HEAD, make a commit; otherwise, do nothing.
           if ! git diff --cached --quiet; then
             git commit -m "chore: sync KEV data $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
+            echo "Changes committed & pushed."
           else
             echo "No changes detected."
           fi
