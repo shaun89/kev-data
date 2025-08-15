@@ -2,16 +2,16 @@
 name: Sync KEV data
 
 on:
-  # 4 PM Eastern year-round:
-  #  - Mar–Oct (DST): 20:00 UTC
-  #  - Nov–Feb:       21:00 UTC
+  # 4 PM Eastern:
+  #  - Mar–Oct ≈ 20:00 UTC
+  #  - Nov–Feb ≈ 21:00 UTC
   schedule:
     - cron: "0 20 * 3-10 *"
     - cron: "0 21 * 11,12,1,2 *"
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # allow commits/pushes via GITHUB_TOKEN
+  contents: write
 
 concurrency:
   group: kev-sync
@@ -21,7 +21,6 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
     steps:
       - name: Checkout (shallow)
         uses: actions/checkout@v4
@@ -34,7 +33,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Fetch & validate → replace atomically (with logs)
+      - name: Fetch → validate → hash-compare → replace if changed
         shell: bash
         run: |
           set -euo pipefail
@@ -42,44 +41,49 @@ jobs:
 
           CSV_URL="https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
           JSON_URL="https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-          UA="kev-sync/1.0 (+github actions)"
           CSV_OUT="known_exploited_vulnerabilities.csv"
           JSON_OUT="known_exploited_vulnerabilities.json"
 
-          # Show current repo state for debugging
-          ls -l || true
+          # Always download to temp (with retries)
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$CSV_OUT.tmp"  "$CSV_URL"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$JSON_OUT.tmp" "$JSON_URL"
 
-          # HEAD requests for visibility
-          curl -I -H "User-Agent: $UA" "$CSV_URL"  || true
-          curl -I -H "User-Agent: $UA" "$JSON_URL" || true
+          # Validate before touching originals
+          head -n 1 "$CSV_OUT.tmp" | grep -qiE 'cve|vulnerability|date|vendor|product' || {
+            echo "CSV header sanity check failed"; exit 1; }
+          jq . < "$JSON_OUT.tmp" >/dev/null
 
-          # Download to temp with retries + conditional GET
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-               -H "User-Agent: $UA" \
-               -z "$CSV_OUT" -o "$CSV_OUT.tmp" "$CSV_URL" || exit 1
+          # Compute old/new hashes (OLD may not exist on first run)
+          old_csv_hash="$( [ -f "$CSV_OUT" ]  && sha256sum "$CSV_OUT"  | awk '{print $1}' || echo 'NONE' )"
+          old_json_hash="$( [ -f "$JSON_OUT" ] && sha256sum "$JSON_OUT" | awk '{print $1}' || echo 'NONE' )"
+          new_csv_hash="$(sha256sum "$CSV_OUT.tmp"  | awk '{print $1}')"
+          new_json_hash="$(sha256sum "$JSON_OUT.tmp" | awk '{print $1}')"
 
-          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
-               -H "User-Agent: $UA" \
-               -z "$JSON_OUT" -o "$JSON_OUT.tmp" "$JSON_URL" || exit 1
+          echo "CSV  old:$old_csv_hash  new:$new_csv_hash"
+          echo "JSON old:$old_json_hash new:$new_json_hash"
 
-          # If 304 (Not Modified), temp can be empty—clean it up
-          [ -s "$CSV_OUT.tmp" ]  || rm -f "$CSV_OUT.tmp"
-          [ -s "$JSON_OUT.tmp" ] || rm -f "$JSON_OUT.tmp"
-
-          # Validate + swap in place
-          if [ -f "$CSV_OUT.tmp" ]; then
-            head -n 1 "$CSV_OUT.tmp" | grep -qiE 'cve|vulnerability|date|vendor|product' \
-              || { echo "CSV header sanity check failed"; exit 1; }
+          # Replace only when content actually changed
+          if [ "$old_csv_hash" != "$new_csv_hash" ]; then
             mv -f "$CSV_OUT.tmp" "$CSV_OUT"
+          else
+            rm -f "$CSV_OUT.tmp"
           fi
 
-          if [ -f "$JSON_OUT.tmp" ]; then
-            jq . < "$JSON_OUT.tmp" >/dev/null
+          if [ "$old_json_hash" != "$new_json_hash" ]; then
             mv -f "$JSON_OUT.tmp" "$JSON_OUT"
+          else
+            rm -f "$JSON_OUT.tmp"
           fi
 
-          # Show final sizes for visibility
           ls -l "$CSV_OUT" "$JSON_OUT" || true
+
+      - name: Debug: show git status/diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --porcelain=v1
+          echo "==== DIFF (working vs HEAD) ===="
+          git diff --stat || true
 
       - name: Commit if data changed
         run: |
@@ -87,6 +91,9 @@ jobs:
           git config user.name  "kev-sync-bot"
           git config user.email "actions@users.noreply.github.com"
           git add known_exploited_vulnerabilities.csv known_exploited_vulnerabilities.json || true
+
+          echo "==== DIFF (cached vs HEAD) ===="
+          git diff --cached --stat || true
 
           if ! git diff --cached --quiet; then
             git commit -m "chore: sync KEV data $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
